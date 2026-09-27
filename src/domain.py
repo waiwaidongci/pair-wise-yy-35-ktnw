@@ -11,12 +11,20 @@ class NotFoundError(DomainError): kind=ErrorKind.NOT_FOUND
 class PermissionDenied(DomainError): kind=ErrorKind.FORBIDDEN
 class ConflictError(DomainError): kind=ErrorKind.CONFLICT
 SEVERITIES=['low', 'elevated', 'high', 'critical']; STATES=['recorded', 'reviewing', 'investigation', 'follow_up', 'closed']; ROLES=['dosimetrist', 'radiation_officer', 'health_physicist', 'viewer']
+ANOMALY_TYPES=['lost', 'not_recovered', 'malfunction']; INCIDENT_STATUSES=['open', 'closed']
+DOSE_SOURCES=['original_reading', 'pending_remeasurement', 'backup_dosimeter']
 @dataclass(frozen=True)
 class Item:
     id:int; title:str; description:str; severity:str; quantity:float; threshold:float; status:str; version:int; external_ref:Optional[str]; created_by:str; created_at:str; updated_at:str
 @dataclass(frozen=True)
 class Record:
     id:int; item_id:int; kind:str; detail:str; status:str; external_ref:Optional[str]; created_by:str; created_at:str
+@dataclass(frozen=True)
+class DosimeterIncident:
+    id:int; item_id:int; dosimeter_id:str; wearing_period:str; anomaly_type:str; status:str
+    original_dose:float; original_excluded:bool; replacement_dose:Optional[float]
+    backup_dosimeter_id:Optional[str]; verified_by:Optional[str]; version:int
+    created_by:str; created_at:str; updated_at:str
 @dataclass(frozen=True)
 class AuditEntry:
     id:int; action:str; entity_type:str; entity_id:int; actor:str; detail:Dict[str,Any]; previous_hash:str; entry_hash:str; created_at:str
@@ -27,6 +35,9 @@ def require_text(value,field,max_length=2000):
     return value
 def normalize_severity(value):
     if value not in SEVERITIES: raise ValidationError("severity不在允许范围内")
+    return value
+def normalize_anomaly_type(value):
+    if value not in ANOMALY_TYPES: raise ValidationError("anomaly_type必须是lost、not_recovered或malfunction")
     return value
 def require_number(value,field,minimum=0.0):
     if isinstance(value,bool): raise ValidationError(f"{field}必须是数字")
