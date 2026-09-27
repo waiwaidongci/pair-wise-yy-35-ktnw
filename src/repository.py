@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import DOSE_STATUSES, ID_PREFIX, STATES
 
 
 class Repository:
@@ -65,7 +65,48 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS dosimeter_incidents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    dosimeter_no TEXT NOT NULL,
+                    wear_period TEXT NOT NULL,
+                    anomaly_type TEXT NOT NULL,
+                    original_dose REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ('open','resolved')),
+                    version INTEGER NOT NULL DEFAULT 1,
+                    replacement_dose REAL,
+                    spare_dosimeter_no TEXT,
+                    verified_by TEXT,
+                    verified_at TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_incident_open_period
+                    ON dosimeter_incidents(dosimeter_no, wear_period)
+                    WHERE status='open';
+                CREATE INDEX IF NOT EXISTS ix_incident_item
+                    ON dosimeter_incidents(item_id);
             """)
+            self._migrate_columns()
+
+    _ITEM_ADDED_COLUMNS = (
+        ("dosimeter_no", "TEXT"),
+        ("wear_period", "TEXT"),
+        ("dose_status", f"TEXT NOT NULL DEFAULT '{DOSE_STATUSES[0]}'"),
+        ("replacement_dose", "REAL"),
+        ("effective_dose", "REAL NOT NULL DEFAULT 0"),
+    )
+
+    def _migrate_columns(self) -> None:
+        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(items)")}
+        for name, decl in self._ITEM_ADDED_COLUMNS:
+            if name not in existing:
+                self.conn.execute(f"ALTER TABLE items ADD COLUMN {name} {decl}")
+        self.conn.execute(
+            "UPDATE items SET effective_dose=quantity WHERE effective_dose=0 AND dose_status=?"
+            , (DOSE_STATUSES[0],))
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -73,16 +114,20 @@ class Repository:
 
     def create_item(self, title: str, description: str, severity: str,
                     quantity: float, threshold: float, external_ref: Optional[str],
-                    actor: str) -> Dict[str, Any]:
+                    actor: str, dosimeter_no: Optional[str] = None,
+                    wear_period: Optional[str] = None) -> Dict[str, Any]:
         now = utc_now()
         try:
             with self._lock, self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO items(title, description, severity, quantity, threshold,
-                       status, version, external_ref, created_by, created_at, updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                       status, version, external_ref, dosimeter_no, wear_period,
+                       dose_status, replacement_dose, effective_dose,
+                       created_by, created_at, updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (title, description, severity, quantity, threshold, STATES[0], 1,
-                     external_ref, actor, now, now),
+                     external_ref, dosimeter_no, wear_period, DOSE_STATUSES[0], None,
+                     quantity, actor, now, now),
                 )
                 item_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
@@ -156,6 +201,119 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    @staticmethod
+    def _incident(row: sqlite3.Row) -> Dict[str, Any]:
+        return dict(row)
+
+    def create_incident(self, item_id: int, dosimeter_no: str, wear_period: str,
+                        anomaly_type: str, original_dose: float,
+                        actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO dosimeter_incidents(item_id, dosimeter_no, wear_period,
+                       anomaly_type, original_dose, status, version, created_by,
+                       created_at, updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (item_id, dosimeter_no, wear_period, anomaly_type, original_dose,
+                     "open", 1, actor, now, now),
+                )
+                incident_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("同周期同编号已有未结案的有效补测事件") from exc
+        return self.get_incident(incident_id)
+
+    def get_incident(self, incident_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM dosimeter_incidents WHERE id=?", (incident_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("坏损剂量计事件不存在")
+        return self._incident(row)
+
+    def list_incidents(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM dosimeter_incidents"
+        params: tuple = ()
+        if status:
+            sql += " WHERE status=?"
+            params = (status,)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [self._incident(row) for row in rows]
+
+    def list_open_incidents(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM dosimeter_incidents WHERE item_id=? AND status='open' ORDER BY id",
+                (item_id,),
+            ).fetchall()
+        return [self._incident(row) for row in rows]
+
+    def list_incidents_for_item(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM dosimeter_incidents WHERE item_id=? ORDER BY id",
+                (item_id,),
+            ).fetchall()
+        return [self._incident(row) for row in rows]
+
+    def open_incident_count(self, item_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM dosimeter_incidents WHERE item_id=? AND status='open'",
+                (item_id,),
+            ).fetchone()
+        return int(row["n"])
+
+    def apply_excluded_dose(self, item_id: int, dosimeter_no: Optional[str],
+                            wear_period: Optional[str]) -> None:
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE items SET dose_status=?, replacement_dose=NULL,
+                   effective_dose=0, version=version+1, updated_at=?,
+                   dosimeter_no=COALESCE(dosimeter_no, ?),
+                   wear_period=COALESCE(wear_period, ?)
+                   WHERE id=?""",
+                (DOSE_STATUSES[1], now, dosimeter_no, wear_period, item_id),
+            )
+
+    def apply_replacement_dose(self, item_id: int, replacement_dose: float) -> None:
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE items SET dose_status=?, replacement_dose=?,
+                   effective_dose=?, version=version+1, updated_at=? WHERE id=?""",
+                (DOSE_STATUSES[2], replacement_dose, replacement_dose, now, item_id),
+            )
+
+    def resolve_incident(self, incident_id: int, replacement_dose: float,
+                         spare_dosimeter_no: str, verified_by: str,
+                         expected_version: int) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM dosimeter_incidents WHERE id=?", (incident_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("坏损剂量计事件不存在")
+            if row["status"] != "open":
+                raise ConflictError("该补测事件已结案")
+            if row["version"] != expected_version:
+                raise ConflictError("版本冲突，请刷新后重试")
+            self.conn.execute(
+                """UPDATE dosimeter_incidents SET status='resolved',
+                   replacement_dose=?, spare_dosimeter_no=?, verified_by=?,
+                   verified_at=?, version=version+1, updated_at=? WHERE id=?""",
+                (replacement_dose, spare_dosimeter_no, verified_by, now, now,
+                 incident_id),
+            )
+        return self.get_incident(incident_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

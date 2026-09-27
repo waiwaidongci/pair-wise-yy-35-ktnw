@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 class ErrorKind:
@@ -20,6 +21,9 @@ class Record:
 @dataclass(frozen=True)
 class AuditEntry:
     id:int; action:str; entity_type:str; entity_id:int; actor:str; detail:Dict[str,Any]; previous_hash:str; entry_hash:str; created_at:str
+@dataclass(frozen=True)
+class DosimeterIncident:
+    id:int; item_id:int; dosimeter_no:str; wear_period:str; anomaly_type:str; original_dose:float; status:str; version:int; replacement_dose:Optional[float]; spare_dosimeter_no:Optional[str]; verified_by:Optional[str]; verified_at:Optional[str]; created_by:str; created_at:str; updated_at:str
 def require_text(value,field,max_length=2000):
     if not isinstance(value,str) or not value.strip(): raise ValidationError(f"{field}不能为空")
     value=value.strip()
@@ -36,3 +40,13 @@ def require_number(value,field,minimum=0.0):
     return number
 def ensure_role(role,allowed):
     if role not in allowed: raise PermissionDenied("当前角色无权执行该操作")
+PERIOD_RE=re.compile(r'^\d{4}-(?:0[1-9]|1[0-2])$')
+DOSIMETER_NO_RE=re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')
+def require_wear_period(value):
+    value=require_text(value,"wear_period",20)
+    if not PERIOD_RE.match(value): raise ValidationError("wear_period格式必须为YYYY-MM")
+    return value
+def require_dosimeter_no(value,field="dosimeter_no"):
+    value=require_text(value,field,64)
+    if not DOSIMETER_NO_RE.match(value): raise ValidationError(f"{field}只能包含字母、数字、下划线或连字符")
+    return value
